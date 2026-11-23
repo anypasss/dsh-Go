@@ -60,6 +60,7 @@ import io.github.ccch1mneyyy.dsh_app.phone.PhoneRegistry
 import io.github.ccch1mneyyy.dsh_app.phone.PhoneUnlocks
 import io.github.ccch1mneyyy.dsh_app.phone.UserGate
 import io.github.ccch1mneyyy.dsh_app.phone.PhonePromptPresenter
+import io.github.ccch1mneyyy.dsh_app.phone.PromptKind
 import io.github.ccch1mneyyy.dsh_app.phone.PhonePromptUi
 import io.github.ccch1mneyyy.dsh_app.phone.PromptPresentation
 import io.github.ccch1mneyyy.dsh_app.phone.MainThreadCall
@@ -140,6 +141,12 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     }
     private var confirmCard: Card? = null
     private var handoffCard: Card? = null
+    /** The handoff card is folded into the floating ball; tapping the ball brings it back. */
+    private var handoffCollapsed = false
+    private var handoffDragX = 0
+    private var handoffDragY = 0
+    private var handoffDragRawX = 0f
+    private var handoffDragRawY = 0f
     private var pendingConfirm: Pending<Decision>? = null
     private var pendingHandoff: Pending<HandoffResult>? = null
     @Volatile private var sharedPrompt: PromptPresentation? = null
@@ -575,7 +582,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     private fun unlocks(): PhoneUnlocks = debugUnlocks ?: PhoneRegistry.unlocks()
 
     /** A confirm (or a shared prompt) is up: the line points at it. */
-    private fun waiting() = pendingConfirm != null || sharedPrompt != null
+    private fun waiting() = pendingConfirm != null || sharedPrompt != null || pendingHandoff != null
 
     private fun showPill() {
         if (pill == null) {
@@ -1050,9 +1057,12 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     override fun showPrompt(presentation: PromptPresentation): (() -> Unit)? {
         val p = presentation
         if (Looper.myLooper() != Looper.getMainLooper() || !p.live || confirmCard != null || handoffCard != null) return null
+        val isHandoffPrompt = p.ticket.content.kind == PromptKind.HANDOFF
+        val onCollapse: (() -> Unit)? = if (isHandoffPrompt) { { collapsePrompt() } } else null
+        val onDrag: ((MotionEvent) -> Boolean)? = if (isHandoffPrompt) { { event -> dragPrompt(event) } } else null
         val root = FrameLayout(service).apply {
             setPadding(dp(6), dp(6), dp(6), dp(6))
-            addView(PhonePromptUi.card(service, p), FrameLayout.LayoutParams(
+            addView(PhonePromptUi.card(service, p, onCollapse = onCollapse, onDrag = onDrag), FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
         showWindow(root)
@@ -1062,6 +1072,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         if (!p.markShown()) { remove(root); return null }
         sharedPrompt = p
         confirmCard = Card(root, layout, null)
+        promptCollapsed = false
         root.addOnLayoutChangeListener(obstacleWatch)
         holdFold(FoldClock.Hold.CONFIRM)
         renderPill()
@@ -1174,9 +1185,69 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         remove(card.root)
         confirmCard = null
         pendingConfirm = null
+        promptCollapsed = false
         releaseFold(FoldClock.Hold.CONFIRM)
+        syncWindows()
         renderPill()
         avoidObstacles()
+    }
+
+    // ---- prompt card folded into the ball -------------------------------------------------------
+
+    /** Fold the handoff prompt card into the existing floating ball. */
+    private fun collapsePrompt() {
+        val card = confirmCard ?: return
+        if (sharedPrompt == null || promptCollapsed) return
+        promptCollapsed = true
+        card.root.visibility = View.GONE
+        if (!ballShown) {
+            if (fold.form != FoldClock.Form.BALL) fold.foldByHand(now())
+            if (!ballShown) foldPill(animationsOn())
+        } else {
+            syncWindows()
+        }
+        if (!ballShown) {
+            promptCollapsed = false
+            card.root.visibility = if (captureHidden) View.INVISIBLE else View.VISIBLE
+            syncWindows()
+            return
+        }
+        renderPill()
+        applyIdle(animated = false)
+        scheduleFold()
+    }
+
+    /** Tap the waiting ball to bring the handoff prompt card back. */
+    private fun expandPrompt() {
+        val card = confirmCard ?: return
+        if (!promptCollapsed) return
+        promptCollapsed = false
+        ballShown = false
+        card.root.visibility = if (captureHidden) View.INVISIBLE else View.VISIBLE
+        syncWindows()
+        renderPill()
+    }
+
+    /** Drag the prompt card by its title row, grip or body text. */
+    private fun dragPrompt(event: MotionEvent): Boolean {
+        val card = confirmCard ?: return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                promptDragX = card.params.x
+                promptDragY = card.params.y
+                promptDragRawX = event.rawX
+                promptDragRawY = event.rawY
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                card.params.x = (promptDragX + event.rawX - promptDragRawX).roundToInt()
+                card.params.y = (promptDragY + event.rawY - promptDragRawY).roundToInt()
+                update(card.root, card.params)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> return true
+        }
+        return false
     }
 
     // ---- handoff --------------------------------------------------------------------------------
@@ -1185,6 +1256,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         if (sharedPrompt != null || pending.value != null) return false
         pendingHandoff?.resolve(HandoffResult.STOP)
         dismissHandoff()
+        handoffCollapsed = false
         val c = colors()
         darkBuilt = isDark()
         val deadline = SystemClock.uptimeMillis() + timeoutMs
@@ -1197,15 +1269,32 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         }
         val head = LinearLayout(service).apply { gravity = Gravity.CENTER_VERTICAL }
         head.addView(TextView(service).apply {
+            text = "≡"
+            textSize = 18f
+            setTextColor(c.muted)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), 0, dp(6), 0)
+            isClickable = false
+            contentDescription = AppStrings.get(service, R.string.overlay_collapse)
+            setOnTouchListener { _, event -> dragHandoff(event) }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
+        head.addView(TextView(service).apply {
             text = cause?.let { PhonePromptUi.handoffCause(service, it) } ?: AppStrings.get(service, R.string.overlay_handoff_title)
             textSize = 12f; setTextColor(c.accent); typeface = Typeface.DEFAULT_BOLD
+            setOnTouchListener { _, event -> dragHandoff(event) }
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val countdown = TextView(service).apply { textSize = 12f; setTextColor(c.muted) }
+        val countdown = TextView(service).apply {
+            textSize = 12f; setTextColor(c.muted)
+            setOnTouchListener { _, event -> dragHandoff(event) }
+        }
         head.addView(countdown)
+        head.addView(textButton(AppStrings.get(service, R.string.overlay_collapse), c.muted, c) { collapseHandoff() },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
         card.addView(head)
         card.addView(TextView(service).apply {
             text = reason; textSize = 15f; setTextColor(c.ink); maxLines = 4; ellipsize = TextUtils.TruncateAt.END
             setLineSpacing(0f, 1.25f); setPadding(0, dp(6), 0, dp(2))
+            setOnTouchListener { _, event -> dragHandoff(event) }
         })
         card.addView(TextView(service).apply {
             text = AppStrings.get(service, R.string.overlay_handoff_hint); textSize = 12f; setTextColor(c.faint); setPadding(0, 0, 0, dp(6))
@@ -1240,7 +1329,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         if (pending.value != null) { remove(root); return false }
         handoffCard = Card(root, params, tick)
         pendingHandoff = pending
-        // The card says it all: capsule and ball step aside, and the capsule comes back after.
+        // It starts as a normal card; 收起 folds it into the floating ball so it stops covering the page.
         holdFold(FoldClock.Hold.HANDOFF)
         syncWindows()
         tick.run()
@@ -1254,8 +1343,66 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         remove(card.root)
         handoffCard = null
         pendingHandoff = null
+        handoffCollapsed = false
         syncWindows()
         releaseFold(FoldClock.Hold.HANDOFF)
+        renderPill()
+    }
+
+    /** Fold the handoff card into the existing floating ball; the ball keeps a waiting mark. */
+    private fun collapseHandoff() {
+        val card = handoffCard ?: return
+        if (handoffCollapsed) return
+        handoffCollapsed = true
+        card.root.visibility = View.GONE
+        if (!ballShown) {
+            if (fold.form != FoldClock.Form.BALL) fold.foldByHand(now())
+            if (!ballShown) foldPill(animationsOn())
+        } else {
+            syncWindows()
+        }
+        if (!ballShown) {
+            // No ball window on this device: keep the card usable instead of losing the prompt.
+            handoffCollapsed = false
+            card.root.visibility = if (captureHidden) View.INVISIBLE else View.VISIBLE
+            syncWindows()
+            return
+        }
+        renderPill()
+        applyIdle(animated = false)
+        scheduleFold()
+    }
+
+    /** A tap on the waiting ball brings the handoff card back. */
+    private fun expandHandoff() {
+        val card = handoffCard ?: return
+        if (!handoffCollapsed) return
+        handoffCollapsed = false
+        card.root.visibility = if (captureHidden) View.INVISIBLE else View.VISIBLE
+        syncWindows()
+        renderPill()
+    }
+
+    /** Drag the handoff card by its ≡ grip. Keeps the whole card reachable anywhere on screen. */
+    private fun dragHandoff(event: MotionEvent): Boolean {
+        val card = handoffCard ?: return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                handoffDragX = card.params.x
+                handoffDragY = card.params.y
+                handoffDragRawX = event.rawX
+                handoffDragRawY = event.rawY
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                card.params.x = (handoffDragX + event.rawX - handoffDragRawX).roundToInt()
+                card.params.y = (handoffDragY + event.rawY - handoffDragRawY).roundToInt()
+                update(card.root, card.params)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> return true
+        }
+        return false
     }
 
     // ---- guarded buttons ------------------------------------------------------------------------
@@ -1359,6 +1506,10 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     }
 
     private fun onBallTapped() {
+        if (handoffCard != null && handoffCollapsed) {
+            expandHandoff()
+            return
+        }
         if (fold.unfold(now())) unfoldPill(animationsOn())
         applyIdle(animated = true)
         scheduleFold()
@@ -1367,6 +1518,10 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     /** The mark (or the card's 收成小球): folded until the ball is tapped, for the rest of this task. */
     private fun collapseByHand() {
         endEditing()
+        if (handoffCard != null && !handoffCollapsed) {
+            collapseHandoff()
+            return
+        }
         if (fold.foldByHand(now())) foldPill(animationsOn())
         scheduleFold()
     }
@@ -1549,8 +1704,9 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         syncPreview()
         syncBeam()
         val p = pill ?: return
-        val handoff = handoffCard != null
+        val handoff = handoffCard != null && !handoffCollapsed
         val shown = if (captureHidden) View.INVISIBLE else View.VISIBLE
+        confirmCard?.root?.visibility = if (sharedPrompt != null && promptCollapsed) View.GONE else shown
         p.root.visibility = if (handoff || ballShown) View.GONE else shown
         ball?.root?.visibility = if (handoff || !ballShown) View.GONE else shown
     }
