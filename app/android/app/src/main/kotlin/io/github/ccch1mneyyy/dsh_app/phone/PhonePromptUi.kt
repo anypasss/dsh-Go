@@ -57,7 +57,7 @@ internal object PhonePromptUi {
         PromptChoice.CONTINUE -> R.string.phone_prompt_continue
     })
 
-    fun card(ctx: Context, p: PromptPresentation): View {
+    fun card(ctx: Context, p: PromptPresentation, onCollapse: (() -> Unit)? = null, onDrag: ((MotionEvent) -> Boolean)? = null): View {
         val dark = ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
         val bg = if (dark) 0xFF232730.toInt() else 0xFFFBFCFF.toInt()
         val ink = if (dark) 0xFFE6E9F0.toInt() else 0xFF1E232E.toInt()
@@ -70,11 +70,38 @@ internal object PhonePromptUi {
             background = GradientDrawable().apply { setColor(bg); cornerRadius = dp(ctx, 20).toFloat() }
             filterTouchesWhenObscured = true
         }
-        card.addView(TextView(ctx).apply {
+        val head = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(ctx, 8))
+        }
+        if (onDrag != null) {
+            head.addView(TextView(ctx).apply {
+                text = "≡"
+                textSize = 18f; setTextColor(ink)
+                gravity = Gravity.CENTER
+                setPadding(dp(ctx, 6), 0, dp(ctx, 6), 0)
+                isClickable = false
+                contentDescription = AppStrings.get(ctx, R.string.overlay_collapse)
+                setOnTouchListener { _, event -> onDrag(event) }
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(ctx, 40)))
+        }
+        head.addView(TextView(ctx).apply {
             text = title(ctx, p.ticket.content)
             textSize = 14f; setTextColor(ink); typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(ctx, 8))
-        })
+            if (onDrag != null) setOnTouchListener { _, event -> onDrag(event) }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (onCollapse != null) {
+            head.addView(TextView(ctx).apply {
+                text = AppStrings.get(ctx, R.string.overlay_collapse)
+                textSize = 12f; setTextColor(accent); typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setPadding(dp(ctx, 10), 0, dp(ctx, 8), 0)
+                isClickable = true; isFocusable = true
+                setOnClickListener { onCollapse() }
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(ctx, 40)))
+        }
+        card.addView(head)
         // Keep attribution outside the scroll area, including short landscape windows/large text.
         val content = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         content.addView(TextView(ctx).apply {
