@@ -451,7 +451,8 @@ internal object BallGeometry {
 internal object CardMetrics {
     /** Window cap of the confirm card and of the handoff card, in dp. */
     const val CONFIRM_DP = 472
-    const val HANDOFF_DP = 492
+    /** Narrow enough to sit beside the page; the card can be dragged or folded into the ball. */
+    const val HANDOFF_DP = 320
 
     /** The window width in px for a display [displayW] px wide ([density] as DisplayMetrics has it). */
     fun windowWidthPx(displayW: Int, density: Float, capDp: Int): Int =
